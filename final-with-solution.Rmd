@@ -1,0 +1,555 @@
+---
+title: 'CSCI E-63C: Final Exam: solution'
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(ROCR)
+library(reshape2)
+library(randomForest)
+library(e1071)
+library(class)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Preface
+
+For the final exam/project we will develop classification models using several approaches and compare their performance on a new dataset -- so-called "Census Income" from UCI ML.  It is available at UCI ML web site under http://archive.ics.uci.edu/ml/datasets/Adult, but so we are not at the mercy of UCI ML availability at the end of the course, there is also a local copy of it in Canvas as a zip-archive of all associated files.  Among other things, the description for this dataset also presents performance (prediction accuracy) observed by the dataset providers using variety of modeling techniques -- this supplies a context for the errors of the models we will develop here.
+
+Please note that the original data has been split up into training and test subsets, but there doesn't seem to be anything particular about that split, so we might want to pool those two datasets together and split them into training and test as necessary ourselves. As you do that, please check that the attribute levels are consistent between those two files.  For instance, the categorized income levels are indicated using slightly different notation in their training and test data.   By now it should be quite straightforward for you to correct that when you pool them together.
+
+Also, please note that there is non-negligible number of rows with missing values that for most analyses cannot be included as they are in the computation.  Please decide how you want to handle them and proceed accordingly.  The simplest and perfectly acceptable approach would be to exclude those observations from the rest of the analyses, but if you have time and inclination to investigate the impact of imputing them by various means, you are welcome to try.
+
+Attribute called "final weight" in the dataset description represents demographic weighting of these observations.  Please disregard it for the purposes of this assignment.
+
+Additionally, several attributes in this dataset are categorical variables with more than two levels (e.g. native country, occupation, etc.).  Please make sure to translate them into corresponding sets of dummy indicator variables for the methods that require such conversion (e.g. PCA) -- R function `model.matrix` can be convenient for this, instead of generating those 0/1 indicators for each level of the factor manually (which is still perfectly fine).  Some of those multi-level factors contain very sparsely populated categories -- e.g. occupation "Armed-Forces" or work class "Never-worked" -- it is your call whether you want to keep those observations in the data or exclude also on the basis that there is not enough data to adequately capture the impact of those categories. Feel free to experiment away!
+
+Among the multi-level categorical attributes, native country attribute has the largest number of levels -- several folds higher than any other attribute in this dataset -- some of which have relatively few observations.  This associated increase in dimensionality of the data may not be accompanied by a corresponding gain of resolution -- e.g. would we expect this data to support the difference in income between descendants from Peru and Nicaragua, for example, or Cambodia and Laos?  Please feel free to evaluate the impact of inclusion and/or omission of this attribute in/from the model and/or discretizing it differently (e.g. US/non-US, etc.).
+
+Lastly, the size of this dataset can make some of the modeling techniques run slower than what we were typically encountering in this class.  You may find it helpful to do some of the exploration and model tuning on multiple random samples of smaller size as you decide on useful ranges of parameters/modeling choices, and then only perform a final run of fully debugged and working code on the full dataset.
+
+# Problem 1: univariate and unsupervised analysis (20 points)
+
+Download and read "Census Income" data into R and prepare graphical and numerical summaries of it: e.g. histograms of continuous attributes, contingency tables of categorical variables, scatterplots of continuous attributes with some of the categorical variables indicated by color/symbol shape, etc.  Perform principal components analysis of this data (do you need to scale it prior to that? how would you represent multilevel categorical attributes to be used as inputs for PCA?) and plot observations in the space of the first few principal components with subjects' gender and/or categorized income indicated by color/shape of the symbol.  Perform univariate assessment of associations between outcome we will be modeling and each of the attributes (e.g. t-test or logistic regression for continuous attributes, contingency tables/Fisher exact test/$\chi^2$ test for categorical attributes).  Summarize your observations from these assessments: does it appear that there is association between outcome and predictors? Which predictors seem to be more/less relevant?
+
+## Solution
+
+Read the data, pool together training and test datasets:
+
+```{r readData}
+censIncTrain <- read.table("CensusIncome/adult.data",sep=",",header=FALSE,as.is=TRUE,strip.white=T,na.strings = "?")
+colnames(censIncTrain) <-  c("Age","WorkClass","FnlWgt","EduCtg","EduCnt","MarStat","Occupation","Relationship","Race","Sex","CapGain","CapLoss","HrsWk","NativeCountry","IncomeCtg")
+censIncTest <- read.table("CensusIncome/adult.test",sep=",",header=FALSE,comment="|",as.is=TRUE,strip.white=T,na.strings = "?")
+colnames(censIncTest) <-  c("Age","WorkClass","FnlWgt","EduCtg","EduCnt","MarStat","Occupation","Relationship","Race","Sex","CapGain","CapLoss","HrsWk","NativeCountry","IncomeCtg")
+censIncTest$IncomeCtg <- gsub(".","",censIncTest$IncomeCtg,fixed=TRUE)
+censIncAll <- rbind(censIncTrain,censIncTest)
+censIncAll$oriTrainTest <- factor(c(rep("train",nrow(censIncTrain)),rep("test",nrow(censIncTest))))
+```
+
+```{r rmNAs}
+sum(rowSums(is.na(censIncAll))!=0) / nrow(censIncAll)
+censIncAll <-  censIncAll[rowSums(is.na(censIncAll))==0,]
+```
+
+About 7% of the observations have missing data -- in principle we could replace them with average / most common category, but for now we just remove them -- there is already a lot of data to work with.
+
+```{r univar}
+dfTmp <- NULL
+pvalsTmp <- NULL
+old.par <- par(mfrow=c(2,3),ps=16)
+for ( tmpNm in colnames(censIncAll) ) {
+  if ( tmpNm == "oriTrainTest" ) {
+     next
+  }
+  if ( class(censIncAll[,tmpNm]) == "character" ) {
+    censIncAll[,tmpNm] <- factor(censIncAll[,tmpNm])
+    #cat(tmpNm,fill=TRUE)
+    tblTmp <- table(censIncAll[,tmpNm])
+    #print(tblTmp)
+    dfTmp <- rbind(dfTmp,data.frame(cnt=as.numeric(tblTmp),ctg=names(tblTmp),attr=tmpNm))
+    #tmpPCAdat <- cbind(tmpPCAdat,model.matrix(as.formula(paste0("~0+",tmpNm)),censIncAll))
+    if ( tmpNm != "IncomeCtg" ) {
+      pvalsTmp <- rbind(pvalsTmp,data.frame(attr=tmpNm,pvalue=chisq.test(table(censIncAll[,c("IncomeCtg",tmpNm)]))$p.value))
+    }
+  } else {
+    xTmp <- censIncAll[,tmpNm]
+    if ( tmpNm %in% c("CapGain","CapLoss") ) {
+      xTmp <- log(xTmp+1)
+    }
+    if ( tmpNm != "FnlWgt") {
+      #tmpPCAdat <- cbind(tmpPCAdat,scale(xTmp))
+      lAttrTmp <- unstack(censIncAll[,c(tmpNm,"IncomeCtg")])
+      pvalsTmp <- rbind(pvalsTmp,data.frame(attr=tmpNm,pvalue=wilcox.test(lAttrTmp[[1]],lAttrTmp[[2]])$p.value))
+    }
+    hist(xTmp,main=tmpNm,xlab="")
+  }
+}
+par(old.par)
+ggplot(dfTmp,aes(x=ctg,y=cnt))+geom_point()+facet_wrap(~attr,scales="free",ncol=3)+scale_y_log10()+xlab("")
+```
+
+Continuous variables in this dataset have very non-normal and for capital gain/loss -- very discontinuous -- distributions.  Whether it has any impact on our ability to model the categorical income level remains to be seen/evaluated.  Categorical variables also often show quite skewed distributions having few levels with very few observations in them -- one of the most striking attributes in this regard is native country -- whether we can improve our predictive performance by translating it into much more coarse classification (e.g. US/non-US) also remains to be seen.
+
+```{r mmAveSD,fig.width=6,fig.height=6}
+tmpPCAdat <- model.matrix(~.,censIncAll[,!colnames(censIncAll)%in%c("oriTrainTest","FnlWgt")])[,-1]
+tmpPCAdat[,"CapGain"] <- log(1+tmpPCAdat[,"CapGain"])
+tmpPCAdat[,"CapLoss"] <- log(1+tmpPCAdat[,"CapLoss"])
+plot(colMeans(tmpPCAdat),apply(tmpPCAdat,2,sd),log="xy")
+```
+
+For PCA continuous variables that are measured on quite different scales have to be scaled/log-transformed.  For categorical variables (that we change to dummy 0/1 indicators for each level of the variable) this decision is less clear cut.  Scaling of dummy variables that represent very sparsely populated levels of categorical attribute will effectively increase their apparent variabilty and thus their influence on PCA outcome, that may or may not be desired outcome.  Let's see how it plays out with income (indicated by the shape of the symbol below) and sex (indicated by the color):
+
+```{r PCA,fig.width=12,fig.height=6}
+old.par <- par(mfrow=c(1,2),ps=16)
+plot(prcomp(tmpPCAdat)$x[,1:2],col=as.numeric(factor(censIncAll$Sex)),pch=as.numeric(factor(censIncAll$IncomeCtg)),main="Untransformed attributes")
+plot(prcomp(scale(tmpPCAdat[,-grep("Income",colnames(tmpPCAdat))]))$x[,1:2],col=as.numeric(factor(censIncAll$Sex)),pch=as.numeric(factor(censIncAll$IncomeCtg)),main="Centered/scaled attributes")
+par(old.par)
+```
+
+PCA on scaled data (including dummy variables) reveals more resolved structure in the data (different levels of both sex and income appear to correspond to different areas of PCA representation).  Coloring resulting plots by different categorical attributes (excluding the one indicated by color from the attributes used for PCA each time) indicates that one of the more defined subsets of data represents married men (possibly because marital status and relationship are two highly correlated variables, so that excluding one of them still leaves the other one in to pull those husbands aways from everyone else) and that there seems to be substantial amount of association between predictor variables and categorical outcome:
+
+```{r PCAbyAttr,fig.width=12,fig.height=6}
+old.par <- par(mfrow=c(2,4),ps=16)
+for ( tmpCnm in c("WorkClass","EduCtg","MarStat","Occupation","Relationship","Race","NativeCountry","IncomeCtg") ) {
+  #cat(grep(tmpCnm,colnames(tmpPCAdat),value=TRUE),fill=TRUE)
+  pcaResTmp <- prcomp(scale(tmpPCAdat[,-grep(tmpCnm,colnames(tmpPCAdat))]))
+  plot(pcaResTmp$x[,1:2],col=as.numeric(factor(censIncAll[,tmpCnm])),main=tmpCnm)
+}
+par(old.par)
+```
+
+Univariate tests of the association of each of the attributes (chi-square for categorical and non-parameteric Wilcoxon rank sum for continuous) with the categorized income indicates that they are all highly significantly associated with it:
+
+```{r univarPvalueTbl}
+pvalsTmp
+```
+
+# Problem 2: logistic regression (25 points)
+
+Develop logistic regression model of the outcome as a function of multiple predictors in the model.  Which variables are significantly associated with the outcome?  Test model performance on multiple splits of data into training and test subsets, summarize it in terms of accuracy/error, sensitivity/specificity and compare to the performance of other methods reported in the dataset description.
+
+## Solution
+
+```{r glmANOVA}
+# exclude EduCnt because collinear with EduCtg resulting
+# in rank deficient model matrix:
+tmpDat <- censIncAll[,c("IncomeCtg","Age","Sex","EduCtg","Race","WorkClass","HrsWk","MarStat","Occupation","Relationship","CapGain","CapLoss","NativeCountry")]
+#summary(glm(IncomeCtg~.,data=tmpDat,family=binomial))
+anovaPvalsTmp <- NULL
+tmpGLMfull <- glm(IncomeCtg~.,data=tmpDat,family=binomial)
+for ( iTmp in 2:ncol(tmpDat) ) {
+  anovaTmp <- anova(glm(IncomeCtg~.,data=tmpDat[,-iTmp],family=binomial),tmpGLMfull,test="Chisq")
+  anovaPvalsTmp <- rbind(anovaPvalsTmp,data.frame(Attribute=colnames(tmpDat)[iTmp], anovaTmp[2,c("Deviance","Pr(>Chi)")]))
+  ##print(anovaPvalsTmp[nrow(anovaPvalsTmp),])
+}
+colnames(anovaPvalsTmp) <- c("Attribute","Deviance","Pr(>Chi)")
+anovaPvalsTmp
+```
+
+ANOVA p-values for comparing full model (using `r paste(colnames(tmpDat)[-1],collapse=", ")` as predictors) with those leaving out each of these attributes indicates that removal of any of them results in statistically significant worsening of the model fit (all $p<10^{`r ceiling(log10(max(anovaPvalsTmp[,"Pr(>Chi)"])))`}$) thus we can use all of them as a first approximation moving forward.  For the purposes of simplicity and brevity we will also disregard the topic of assessing higher order interactions between those predictors, although the amount of data available in principle allows us to evaluate them also.  It is also interesting to note here that those marital status and relationship attributes, although highly related, are not synonymous enough so that leaving one of them out does not statistically significantly decrease the model fit.
+
+Now let's split the data multiple times into training and test subsets (in 2:1 ratio as in the original dataset annotation), fit logistic regression model on the training data and assess its predictions on the test dataset -- while at it, we will also plot ROC curves and calculate AUC using package `ROCR`:
+
+```{r glmTestErrEtc,fig.width=6,fig.height=6}
+dfAccErrSpecSensTmp <- NULL
+for ( iTry in 1:10 ) {
+  bTrain <- sample(c(TRUE,TRUE,FALSE),nrow(tmpDat),replace=TRUE)
+  # so that test data doesn't introduce levels of factor(s)
+  # that have not been present in training data:
+  while ( sum(unique(tmpDat[!bTrain,"NativeCountry"])%in%unique(tmpDat[bTrain,"NativeCountry"])) < length(unique(tmpDat[!bTrain,"NativeCountry"])) ) {
+    bTrain <- sample(c(TRUE,TRUE,FALSE),nrow(tmpDat),replace=TRUE)
+  }
+  glmTmp <- glm(IncomeCtg~.,data=tmpDat[bTrain,],family=binomial)
+  predTmp <- predict(glmTmp,newdata=tmpDat[!bTrain,],type="response")
+  plot(performance(prediction(predTmp,tmpDat[!bTrain,"IncomeCtg"]),"tpr","fpr"),add=ifelse(iTry==1,FALSE,TRUE))
+  tblTmp <- table(tmpDat[!bTrain,"IncomeCtg"],predTmp>0.5)
+  dfAccErrSpecSensTmp <- rbind(dfAccErrSpecSensTmp,data.frame(acc=sum(diag(tblTmp))/sum(tblTmp),err=1-sum(diag(tblTmp))/sum(tblTmp),spec=tblTmp[1,1]/sum(tblTmp[1,]),sens=tblTmp[2,2]/sum(tblTmp[2,]),auc=performance(prediction(predTmp,tmpDat[!bTrain,"IncomeCtg"]),"auc")@y.values[[1]]))
+}
+ggplot(melt(dfAccErrSpecSensTmp),aes(x=variable,y=value,colour=variable))+geom_jitter()+scale_y_continuous(limits=c(0,1))+geom_hline(yintercept=0.155,linetype=2)+ylab("")+xlab("")
+```
+
+The plots above indicate that for 1:2 splits of the data into test and training sets (as it was done for the original split of the data provided by the data submitters) resulting performance metrics show very little variability and that the error from additive logistic regression model is very close to what was reported in the dataset annotation. Median of errors shown there (15.5%) is indicated by the horizontal dashes in the plot -- test error from logistic regression is right on it.
+
+# Problem 3: random forest (25 points)
+
+Develop random forest model of the categorized income. Present variable importance plots and comment on relative importance of different attributes in the model.  Did attributes showing up as more important in random forest model also appear as significantly associated with the outcome by logistic regression?  Test model performance on multiple splits of data into training and test subsets, compare test and out-of-bag error estimates, summarize model performance in terms of accuracy/error, sensitivity/specificity and compare to the performance of other methods reported in the dataset description.
+
+## Solution
+
+```{r rf}
+rfTmp <- randomForest(IncomeCtg~.,censIncAll[,!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt")],importance=TRUE)
+varImpPlot(rfTmp)
+rfTmp
+randomForest(IncomeCtg~.,censIncAll[,!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")])
+tmpDat <- censIncAll[,!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt")]
+tmpDat$NativeCountry <- factor(tmpDat$NativeCountry!="United-States")
+randomForest(IncomeCtg~.,tmpDat)
+dfTmp <- NULL
+for ( nTmp in c(10,50,250) ) {
+  for ( iTry in 1:3 ) {
+    rfTmp <- randomForest(IncomeCtg~.,tmpDat,ntree=nTmp)
+    tblTmp <- rfTmp$confusion[,1:2]
+    dfTmp <- rbind(dfTmp,data.frame(ntree=rfTmp$ntree,acc=sum(diag(tblTmp))/sum(tblTmp),err=1-sum(diag(tblTmp))/sum(tblTmp),spec=tblTmp[1,1]/sum(tblTmp[1,]),sens=tblTmp[2,2]/sum(tblTmp[2,])))
+    # cleanup:
+    rm(rfTmp)
+    gc()
+    ##print(dfTmp[nrow(dfTmp),])
+  }
+}
+ggplot(melt(dfTmp,id='ntree'),aes(x=variable,y=value,colour=factor(ntree),fill=factor(ntree)))+geom_point(position=position_jitterdodge())+scale_y_continuous(limits=c(0,1))+geom_hline(yintercept=c(0.155,0.14),linetype=c(2,3))+ylab("")+xlab("")#+facet_wrap(~variable)
+```
+
+Variable importance plots for the random forest model fit on the entire dataset indicate that the variable selected as the most important for predicting income greater than 50K -- unsurprisingly, capital gain -- is also the one with the smallest ANOVA p-value suggesting greatest impact of excluding this attribiute from logistic regression model.  Three attributes on the lower end of importance by both variable importance plots -- sex, race and native country -- are also three with the largest (albeit still highly significant) p-values from ANOVA table above.  Out of bag (OOB) confusion matrix shown above suggests that random forest model using default parameters and a complete set of predictors makes predictions with higher sensitivity and lower specificity than those from logistic regression.  Exclusion of the native country (with high number of levels many of which can be expected to be scarsely populated and non-informative with respect to the outcome) from the set of predictors appears to improve overall error by several percentage points at the expense of lower sensitivity and higher specificity.  Similar effect is achieved by changing native country representation to two (US and non-US) level category.  Although impact of changing number of trees in the model can be evaluated more extensively (as well as in combination with `mtry` and other model parameters) brief assessment shown above does not indicate that random forest model for this dataset is particularly sensitive to it once at least about a hundred or more trees are included in the model.
+
+Now on to splitting the entire dataset into training and test as it was done for logistic regression.  Here we will also compare "out-of-bag" (OOB) error to that obtained on test dataset that was not used in estimating random forest model.
+
+```{r rftest,fig.width=12,fig.height=6}
+dfAccErrSpecSensRFTmp <- NULL
+for ( iTry in 1:10 ) {
+  bTrain <- sample(c(TRUE,TRUE,FALSE),nrow(censIncAll),replace=TRUE)
+  rfTrain <- randomForest(IncomeCtg~.,censIncAll[bTrain,!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")])
+  tblTmp <- table(censIncAll[!bTrain,"IncomeCtg"],predict(rfTrain,newdata=censIncAll[!bTrain,]))
+  dfAccErrSpecSensRFTmp <- rbind(dfAccErrSpecSensRFTmp,data.frame(type="test",acc=sum(diag(tblTmp))/sum(tblTmp),err=1-sum(diag(tblTmp))/sum(tblTmp),spec=tblTmp[1,1]/sum(tblTmp[1,]),sens=tblTmp[2,2]/sum(tblTmp[2,])))
+  #print(dfAccErrSpecSensRFTmp[nrow(dfAccErrSpecSensRFTmp),])
+  tblTmp <- rfTrain$confusion[,1:2]
+  dfAccErrSpecSensRFTmp <- rbind(dfAccErrSpecSensRFTmp,data.frame(type="OOB",acc=sum(diag(tblTmp))/sum(tblTmp),err=1-sum(diag(tblTmp))/sum(tblTmp),spec=tblTmp[1,1]/sum(tblTmp[1,]),sens=tblTmp[2,2]/sum(tblTmp[2,])))
+  #print(dfAccErrSpecSensRFTmp[nrow(dfAccErrSpecSensRFTmp),])
+}
+ggplot(melt(dfAccErrSpecSensRFTmp,id="type"),aes(x=variable,y=value,colour=variable))+geom_jitter()+scale_y_continuous(limits=c(0,1))+geom_hline(yintercept=0.155,linetype=2)+geom_hline(yintercept=0.14,linetype=3)+ylab("")+xlab("")+facet_wrap(~type)
+```
+
+The plot above represents OOB and true test error for random forest models developed excluding native country from the set of predictors used.  It shows that OOB estimates follow very closely true test estimates of model performance and that error of random forest model excluding native country from the predictor set results in the error that is comparable to the lowest reported by the dataset submitters (horizontal dashes and dots indicate median and minimum error rates reported in the dataset annotation respectively).
+
+# Problem 4: SVM (25 points)
+
+Develop SVM model of this data choosing parameters (e.g. choice of kernel, cost, etc.) that appear to yield better performance.  Test model performance on multiple splits of data into training and test subsets, summarize model performance in terms of accuracy/error, sensitivity/specificity and compare to the performance of other methods reported in the dataset description.
+
+## Solution
+
+First, let's see how long does it take to fit SVM model for subsets of observations of various sizes:
+
+```{r svmelapsed}
+dfTmp <- NULL
+for ( nTmp in floor(500*1.5^(0:6)) ) {
+  for ( iTry in 1:3 ) {
+    pt <- proc.time()
+    svmTmp <- svm(IncomeCtg~.,data=censIncAll[sample(nrow(censIncAll),nTmp),!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")])
+    pt <- proc.time()-pt
+    #cat(nTmp,pt,fill=TRUE)
+    dfTmp <- rbind(dfTmp,data.frame(elapsed=pt['elapsed'],n=nTmp))
+  }
+}
+ggplot(dfTmp,aes(x=n,y=elapsed))+geom_point()+ylab("Elapsed time, sec")+xlab("Training sample size")
+```
+
+From the plot above, we can see that the time it takes `svm` to fit the model increases faster than linearly with the size of the sample used as input, so that on the computer used to compile this solution `svm` with all defaults for parameters can be estimated to take about 10-15 minutes when the 2/3 of the entire dataset is used as training data.  Therefore for the purposes of evaluating dependency of model performance on `svm` parameters such as `kernel`, `cost` etc. we will draw relatively small (on the order of several thousand observations) subsets of data as training and test.  Instead of cross-validation on the entire dataset and to have more representative estimates of variability we will use multiple independent draws of such training and test datasets. We will limit such model tuning to the data subset indicated as training in the dataset annotation, so that testing is done on the dataset not involved at all in model optimization.
+
+```{r miscTrials,echo=FALSE,eval=FALSE}
+#tmpSVMdat <- model.matrix(~.,censIncAll[,c("Age","Sex","EduCnt","EduCtg","Race","WorkClass","HrsWk","MarStat","Occupation","Relationship","CapGain","CapLoss")])[,-1]
+#tmpSVMdat <- tmpPCAdat[,colnames(tmpPCAdat)!="IncomeCtg<=50K"]
+#colnames(tmpSVMdat) <- gsub("IncomeCtg>50K","IncomeCtg",colnames(tmpSVMdat),fixed=TRUE)
+tmpTrainIdx <- sample(nrow(tmpSVMdat),2000)
+#tmpTrainDat <- tmpSVMdat[tmpTrainIdx,]
+#tmpTrainDat <- tmpTrainDat[,apply(tmpTrainDat,2,sd)>0]
+##pt1 <- proc.time(); svmTmp <- svm(IncomeCtg~.,tmpTrainDat,kernel="polynomial",coef0=1,cost=0.01,gamma=0.01); proc.time()-pt1
+#pt1 <- proc.time();svmTmp <- svm(x=tmpTrainDat,y=factor(censIncAll[tmpTrainIdx,"IncomeCtg"]),kernel="polynomial",degree=2,coef0=1,cost=0.1,gamma=0.1);proc.time()-pt1
+pt1 <- proc.time(); svmTmp <- svm(IncomeCtg~.,data=censIncAll[tmpTrainIdx,!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")]); proc.time()-pt1
+dim(svmTmp$SV)
+plot(sort(predict(svmTmp)))
+table(censIncAll[tmpTrainIdx,"IncomeCtg"],predict(svmTmp))
+pt1 <- proc.time(); tblTmp <- table(censIncAll[-tmpTrainIdx,"IncomeCtg"],predict(svmTmp,newdata=censIncAll[-tmpTrainIdx,!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")])); proc.time()-pt1
+tblTmp
+sum(diag(tblTmp))/sum(tblTmp)
+```
+
+Below we will evaluate dependency of SVM test error on such small subsets of the data for linear, polynomial and radial kernels and other parameters associated with each of them (i.e. cost, gamma, etc.).  The results are shown below for ranges of those parameters that reveal dependency of test error on their values for relatively small (i.e. computable within reasonanble time) sets of their levels.  Arriving to those illustrative examples took few trials and errors that for the purposes of brevity are not captured here.  Usualy default values of parameters presented a good starting point, that was further modified to achieve change in test error over multiple trials.
+
+### Linear kernel
+
+```{r svmlin}
+dfTmpLinear <- NULL
+tmpDat <- censIncAll[censIncAll$oriTrainTest=="train",!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")]
+for ( cTmp in c(0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,20,50,100) ) {
+  for ( iTry in 1:5 ) {
+    tmpIdx <- sample(nrow(tmpDat),5000)
+    tmpTrainIdx <- sample(tmpIdx,length(tmpIdx)/2)
+    tmpTestIdx <- tmpIdx[!tmpIdx%in%tmpTrainIdx]
+    svmTmp <- svm(IncomeCtg~.,data=tmpDat[tmpTrainIdx,],cost=cTmp,kernel="linear")
+    tblTmp <- table(tmpDat[tmpTestIdx,"IncomeCtg"],predict(svmTmp,newdata=tmpDat[tmpTestIdx,]))
+    dfTmpLinear <- rbind(dfTmpLinear,data.frame(cost=cTmp,err=1-sum(diag(tblTmp))/sum(tblTmp)))
+  }
+}
+ggplot(dfTmpLinear,aes(x=cost,y=err))+geom_point()+scale_x_log10(breaks=c(0.01,0.1,1,10,100))
+```
+
+For linear kernel the dependency of test error on the parameter `cost` is relatively weak for a wide range of values.  The lowest values of `cost` when test error first reaches its lower levels is somewhere near 0.1-0.5.
+
+### Polynomial kernel
+
+```{r svmpoly}
+dfTmpPolynom <- NULL
+tmpDat <- censIncAll[censIncAll$oriTrainTest=="train",!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")]
+for ( dTmp in c(2:3) ) {
+  for ( coTmp in c(0.01,0.1,1,10) ) {
+    for ( gTmp in c(0.01,0.05,0.25,1.25) ) {
+      for ( cTmp in c(0.2,1,5) ) {
+        for ( iTry in 1:5 ) {
+          tmpIdx <- sample(nrow(tmpDat),5000)
+          tmpTrainIdx <- sample(tmpIdx,length(tmpIdx)/2)
+          tmpTestIdx <- tmpIdx[!tmpIdx%in%tmpTrainIdx]
+          svmTmp <- svm(IncomeCtg~.,data=tmpDat[tmpTrainIdx,],cost=cTmp,kernel="polynomial",gamma=gTmp,degree=dTmp,coef0=coTmp)
+          tblTmp <- table(tmpDat[tmpTestIdx,"IncomeCtg"],predict(svmTmp,newdata=tmpDat[tmpTestIdx,]))
+          dfTmpPolynom <- rbind(dfTmpPolynom,data.frame(cost=cTmp,gamma=gTmp,coef0=coTmp,degree=dTmp,err=1-sum(diag(tblTmp))/sum(tblTmp)))
+          ##cat(dTmp,coTmp,gTmp,cTmp,iTry,1-sum(diag(tblTmp))/sum(tblTmp),fill=TRUE)
+        }
+      }
+    }
+  }
+}
+ggplot(dfTmpPolynom,aes(x=factor(cost),fill=factor(gamma),shape=factor(cost),colour=factor(gamma),y=err))+geom_point(position=position_jitterdodge())+facet_wrap(~degree+coef0,ncol=4)
+```
+
+The plots of test error for the SVM with polynomial kernel shown above suggest that comparable model performance can be attained for multiple combinations of parameter values.  More thorough evaluation of these dependencies could entail use of less coarse grids of parameter values and considering what would entail using "min+1SE" rule to choose optimal model in the case of SVM, but for the purposes of expediency we could just choose one of those combinations that seem to result in the lower test error.  For instance, `degree=2`, `coef0=0.1`, `cost=0.2` and `gamma=0.25`
+
+### Radial kernel
+
+```{r svmrad}
+dfTmpRadial <- NULL
+tmpDat <- censIncAll[censIncAll$oriTrainTest=="train",!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")]
+for ( gTmp in c(0.002,0.01,0.05,0.25,1.25) ) {
+  for ( cTmp in c(0.04,0.2,1,5,25,125) ) {
+   for ( iTry in 1:5 ) {
+      tmpIdx <- sample(nrow(tmpDat),5000)
+      tmpTrainIdx <- sample(tmpIdx,length(tmpIdx)/2)
+      tmpTestIdx <- tmpIdx[!tmpIdx%in%tmpTrainIdx]
+      svmTmp <- svm(IncomeCtg~.,data=tmpDat[tmpTrainIdx,],cost=cTmp,kernel="radial",gamma=gTmp)
+      tblTmp <- table(tmpDat[tmpTestIdx,"IncomeCtg"],predict(svmTmp,newdata=tmpDat[tmpTestIdx,]))
+      dfTmpRadial <- rbind(dfTmpRadial,data.frame(cost=cTmp,gamma=gTmp,err=1-sum(diag(tblTmp))/sum(tblTmp)))
+    }
+  }
+}
+ggplot(dfTmpRadial,aes(x=factor(cost),fill=factor(gamma),shape=factor(cost),colour=factor(gamma),y=err))+geom_point(position=position_jitterdodge())
+```
+
+Evaluation of test error of SVM predictors with radial kernel at several values of `gamma` and `cost` suggests that optimal performance is attainable for cost around 5-25 and gamma around 0.01-0.05.  It is possible that different values of parameters would be optimal for model fit on a substantially larger dataset, e.g. when we are using 2/3 of the entire dataset as training data, but for the purposes of the having it run within reasonable amount of time we will disregard this possibility here.  Furthermore, optimal values of model parameters could be worth choosing following min+1SE rule of thumb, but again we will disregard this for now and just choose them near the apparent minimum of the error -- remember we will be evaluating model performance on the test data that has not been used in this tuning procedure, thus resulting test error will not be subject to overfitting (and thus being overly optimistic) concerns.
+
+### Test SVM error on the entire dataset
+
+From comparing perfromance of SVM models with linear, polynomial and radial kernel, we can, somewhat arbitrarily, choose to use radial kernel with `cost=10` and `gamma=0.01` as the setup that we will fit with the original training data and and test on the test data as defined in the dataset submission.  To make it is little bit more interesting, lets fit it to the entire "original" test dataset as well as few smaller subsets of it and evaluate test error for each of them.
+
+```{r svmtrte,fig.width=12,fig.height=6}
+dfTmpTrTe <- NULL
+tmpTrainDat <- censIncAll[censIncAll$oriTrainTest=="train",!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")]
+tmpTestDat <- censIncAll[censIncAll$oriTrainTest=="test",!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")]
+for ( fTmp in c(100,50,20,10,5,2,1) ) {
+  for ( iTry in 1:min(5,fTmp) ) {
+    pt <- proc.time()
+    tmpTrainIdx <- sample(nrow(tmpTrainDat),nrow(tmpTrainDat)/fTmp)
+    svmTmp <- svm(IncomeCtg~.,data=tmpTrainDat[tmpTrainIdx,],cost=10,kernel="radial",gamma=0.01)
+    tblTmp <- table(tmpTestDat[,"IncomeCtg"],predict(svmTmp,newdata=tmpTestDat))
+    pt <- proc.time()-pt
+    dfTmpTrTe <- rbind(dfTmpTrTe,data.frame(nTr=length(tmpTrainIdx),acc=sum(diag(tblTmp))/sum(tblTmp),err=1-sum(diag(tblTmp))/sum(tblTmp),spec=tblTmp[1,1]/sum(tblTmp[1,]),sens=tblTmp[2,2]/sum(tblTmp[2,]),elapsed=pt['elapsed']))
+  }
+  ##print(ggplot(melt(dfTmpTrTe,id="nTr"),aes(x=nTr,y=value,colour=variable))+geom_point()+scale_x_log10(breaks=c(200,500,1000,2000,5000,10000,20000,50000))+facet_wrap(~variable,scales="free"))
+}
+ggplot(melt(dfTmpTrTe,id="nTr"),aes(x=nTr,y=value,colour=variable))+geom_point()+scale_x_log10(breaks=c(200,500,1000,2000,5000,10000,20000,50000))+facet_wrap(~variable,scales="free")+theme(legend.position="top")
+```
+
+Use of SVM with parameters described above achieves test error of 15% when entire training and test datasets as specified in the original dataset annotation are used to train and test the model respectively.  Using more observations in the training data clearly improves model performance on test data (and takes longer to fit the model).
+
+# Problem 5: compare logistic regression, random forest and SVM model performance (5 points)
+
+Compare performance of the models developed above (logistic regression, random forest, SVM) in terms of their accuracy, error and sensitivity/specificity.  Comment on differences and similarities between them.
+
+## Solution
+
+All three models with few if any modifications to default parameters achieve performance very competetive with that reported in the dataset submission.  Their sensitivity and specificity are also quite comparable (except for random forest using all predictors that seems to achieve very high specificity at the expense of very low sensitivity) -- it is fairly low (just over 60%) sensitivity that they all suffer from.  In other words, these models mis-classify about 40% of observations with reported income higher than 50K. (It could be interesting to reflect on what might be behind this phenomenon -- is it that there are other factors that influence the income that are not captured by this dataset? on which variables are those that are misclassified different from those classified correctly? -- but it is obviously beyond the scope of this final.)  Of those models, given the choices of parameters used here it was random forest that yielded the lowest error when used without native country attribute (or having it represented by two levels -- US/non-US -- categorical predictor).  Given substantial flexibility in fitting SVM model it is possible that greater performance could be achievable for it as well if evaluation of model peformance on their values was conducted more extensively.  Whether the computational cost of such procedure (in comparison for instance to fitting glm or random forest model) is justified by the potential gain in performance has to be evaluated in the context of specific intended usage of such model.
+
+# Extra 10 points: KNN model
+
+Develop KNN model for this data, evaluate its performance for different values of $k$ on different splits of the data into training and test and compare it to the performance of other methods reported in the dataset description.  Notice that this dataset includes many categorical variables as well as continuous attributes measured on different scales, so that the distance has to be defined to be meaningful (probably avoiding subtraction of the numerical values of multi-level factors directly or adding differences between untransformed age and capital gain/loss attributes).
+
+## Solution
+
+First, let's evaluate dependency of model performance on the number of nearest neighbors used for classification -- we'll scale (after log-transform) only continuous variables so that the (mis-)match of the levels of the same categorical attribute would carry the same weight across all categorical predictors.
+
+```{r knnKtune}
+tmpDat <- model.matrix(~.,censIncAll[,!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")])[,-1]
+tmpDat <- tmpDat[,-grep("Income",colnames(tmpDat))]
+tmpDat[,'CapGain'] <- log(1+tmpDat[,'CapGain'])
+tmpDat[,'CapLoss'] <- log(1+tmpDat[,'CapLoss'])
+tmpDat[,'HrsWk'] <- log(tmpDat[,'HrsWk'])
+tmpDat[,'Age'] <- log(tmpDat[,'Age'])
+
+tmpDat[,'CapGain'] <- scale(tmpDat[,'CapGain'])
+tmpDat[,'CapLoss'] <- scale(tmpDat[,'CapLoss'])
+tmpDat[,'HrsWk'] <- scale(tmpDat[,'HrsWk'])
+tmpDat[,'Age'] <- scale(tmpDat[,'Age'])
+
+#tmpDat <- scale(tmpDat)
+tmpTrainDat <- tmpDat[censIncAll$oriTrainTest=="train",]
+tmpClassTrain <- censIncAll[censIncAll$oriTrainTest=="train","IncomeCtg"]
+tmpTestDat <- tmpDat[censIncAll$oriTrainTest=="test",]
+tmpClassTest <- censIncAll[censIncAll$oriTrainTest=="test","IncomeCtg"]
+dfTmpKNN <- NULL
+#for ( kTmp in c(1,3,5,11,21,51,101,201,501) ) {
+for ( kTmp in 2*(0:100)+1 ) {
+  for ( iTry in 1:5 ) {
+    pt <- proc.time()
+    #bTrain <- sample(c(TRUE,TRUE,FALSE),nrow(tmpTrainDat),replace=TRUE)
+    #knnTmp <- knn(tmpTrainDat[bTrain,],tmpTrainDat[!bTrain,],tmpClassTrain[bTrain],k=kTmp)
+    #tblTmp <- table(tmpClassTrain[!bTrain],knnTmp)
+    tmpIdx <- sample(nrow(tmpTrainDat),10000)
+    tmpTrainIdx <- sample(tmpIdx,length(tmpIdx)/2)
+    tmpTestIdx <- tmpIdx[!tmpIdx%in%tmpTrainIdx]
+    knnTmp <- knn(tmpTrainDat[tmpTrainIdx,],tmpTrainDat[tmpTestIdx,],tmpClassTrain[tmpTrainIdx],k=kTmp)
+    tblTmp <- table(tmpClassTrain[tmpTestIdx],knnTmp)
+    pt <- proc.time()-pt
+    dfTmpKNN <- rbind(dfTmpKNN,data.frame(k=kTmp,acc=sum(diag(tblTmp))/sum(tblTmp),err=1-sum(diag(tblTmp))/sum(tblTmp),spec=tblTmp[1,1]/sum(tblTmp[1,]),sens=tblTmp[2,2]/sum(tblTmp[2,]),elapsed=pt['elapsed']))
+  }
+  ##print(ggplot(melt(dfTmpKNN,id="k"),aes(x=k,y=value,colour=variable))+geom_point()+scale_x_continuous()+facet_wrap(~variable,scales="free"))
+}
+summary(lm(err~k,dfTmpKNN[dfTmpKNN$k>=25,]))
+ggplot(melt(dfTmpKNN,id="k"),aes(x=k,y=value,colour=variable))+geom_point()+scale_x_continuous()+facet_wrap(~variable,scales="free")
+```
+
+The above plots evaluating KNN performance on the training data as fuction of the number of nearest neighbors suggest that the lowest erorr is achieved for the values of `k` near 10-25 and when fewer than that nearest neighbors are used for classification the model tends to noticeably overfit the data.  Furthermore, although model performance statistics are fairly flat for $k$ between 20-25 and 100, the error rate starts increasing as KNN model becomes progressively less complex for $k$ over a hundred or so. Therefore, if we adhere to "min+1SE" rule for choosing optimal (less variable) model, we could choose $k$ of about hundred or so as the number of nearest neighbors that are used for classification of new observations.
+
+Below we will evaluate test performance of KNN model for varying sizes of training data (as we did above for SVM) and for values of $k$ of 1, 5, 25, and 125.  For the lowest two values of $k$ we expect substantial amount of overfit and thus higher test error, for the two highest values of $k$ considered here we would still expect higher error rate for the lower of these two if models selected using "min+1SE" rule tend to overfit less than the models fit for parameter value at the minimum of cross-validated model performance.
+
+```{r knntest,fig.width=12,fig.height=6}
+dfTmpTrTeKNN <- NULL
+for ( fTmp in c(100,50,20,10,5,2,1) ) {
+  for ( kTmp in c(1,5,25,125) ) {
+    for ( iTry in 1:min(5,fTmp) ) {
+      pt <- proc.time()
+      tmpTrainIdx <- sample(nrow(tmpTrainDat),nrow(tmpTrainDat)/fTmp)
+      knnTmp <- knn(tmpTrainDat[tmpTrainIdx,],tmpTestDat,tmpClassTrain[tmpTrainIdx],k=kTmp)
+      tblTmp <- table(tmpClassTest,knnTmp)
+      pt <- proc.time()-pt
+      dfTmpTrTeKNN <- rbind(dfTmpTrTeKNN,data.frame(k=kTmp,nTr=length(tmpTrainIdx),acc=sum(diag(tblTmp))/sum(tblTmp),err=1-sum(diag(tblTmp))/sum(tblTmp),spec=tblTmp[1,1]/sum(tblTmp[1,]),sens=tblTmp[2,2]/sum(tblTmp[2,]),elapsed=pt['elapsed']))
+    }
+    ##print(ggplot(melt(dfTmpTrTeKNN,id=c("nTr","k")),aes(x=nTr,y=value,colour=factor(k),fill=factor(k)))+geom_point(position=position_dodge())+scale_x_log10(breaks=c(200,500,1000,2000,5000,10000,20000,50000))+facet_wrap(~variable,scales="free"))
+  }
+}
+ggplot(melt(dfTmpTrTeKNN,id=c("nTr","k")),aes(x=nTr,y=value,colour=factor(k)))+geom_point()+scale_x_log10(breaks=c(200,500,1000,2000,5000,10000,20000,50000))+facet_wrap(~variable,scales="free")+xlab("Training sample size")+ylab("")+theme(legend.position="top")
+```
+
+Results of evaluation of test performance of KNN model indicate that:
+
+* as we have seen for SVM, increase in training sample size improves model performance on test data
+* when using 1 or 5 nearest neighbors model noticeably overfits the data and yields higher test error than when higher numbers of neighbors are used
+* the difference in performance between using `k=25` and `k=125` nearest neighbors is difficult to discern once large training samples are used
+
+It might be that the test errors reported for KNN in the dataset annotation (if "(1)" and "(3)" in the annotation indicate use of $k=1$ and $k=3$ for KNN model respectively) are well in the overfit territory.
+
+# Extra 15 points: variable importance in SVM
+
+SVM does not appear to provide readily available tools for judging relative importance of different attributes in the model.  Please evaluate here an approach similar to that employed by random forest where importance of any given attribute is measured by the decrease in model performance upon randomization of the values for this attribute.
+
+## Solution
+
+Let's start with the simulation where we know for fact which variables are important and which aren't. We'll use two class simulation with interaction in two dimensions and will add from 0 to 10 null variables not associated with the outcome.  
+
+```{r viSVMsimul,fig.width=12,fig.height=6}
+# variable importance for SVM:
+#set.seed(1234567890)
+nObs <- 1000
+ctrPos <- 2
+xyTmp <- matrix(rnorm(4*nObs),ncol=2)
+xyCtrsTmp <- matrix(sample(c(-1,1)*ctrPos,nObs*4,replace=TRUE),ncol=2)
+xyTmp <- xyTmp + xyCtrsTmp
+gTmp <- factor(paste0("class",(1+sign(apply(xyCtrsTmp,1,prod)))/2))
+plot(xyTmp,col=as.numeric(gTmp),pch=as.numeric(gTmp),xlab="X1",ylab="X2")
+abline(h=0)
+abline(v=0)
+dfResTmp <- NULL
+for ( nNull in 0:9 ) {
+  xyTmp <- matrix(rnorm(4*nObs),ncol=2)
+  xyCtrsTmp <- matrix(sample(c(-1,1)*ctrPos,nObs*4,replace=TRUE),ncol=2)
+  xyTmp <- xyTmp + xyCtrsTmp
+  gTmp <- factor(paste0("class",(1+sign(apply(xyCtrsTmp,1,prod)))/2))
+  dfTmp <- data.frame(xyTmp,g=gTmp)
+  if ( nNull > 0 ) {
+    dfTmp <- data.frame(dfTmp,matrix(rnorm(nObs*nNull),nrow=nObs))
+  }
+  #plot(svm(g~.,dfTmp),dfTmp)
+  #table(predict(svm(g~.,dfTmp)),gTmp)
+  if ( FALSE ) {
+    # estimate test error on the entire dataset by bootstrap:
+    errTmp <- numeric()
+    for ( iSim in 1:10 ) {
+      tmpIdx <- sample(nrow(dfTmp),nrow(dfTmp),replace = TRUE)
+      tblTmp <- table(predict(svm(g~.,dfTmp[tmpIdx,]),newdata = dfTmp[-tmpIdx,]),dfTmp[-tmpIdx,"g"])
+      errTmp[iSim] <- 1-sum(diag(tblTmp))/sum(tblTmp)
+    }
+    cat(nNull,mean(errTmp),fill=TRUE)
+  }
+  # for each attribute:
+  for ( iCol in 1:ncol(dfTmp) ) {
+    if ( colnames(dfTmp)[iCol] == "g" ) {
+      next
+    }
+    dErrTmp <- numeric()
+    # over several bootstraps of the data:
+    for ( iSim in 1:10 ) {
+      tmpIdx <- sample(nrow(dfTmp),nrow(dfTmp),replace = TRUE)
+      # calculate error on the original data:
+      tblTmp <- table(predict(svm(g~.,dfTmp[tmpIdx,]),newdata = dfTmp[-tmpIdx,]),dfTmp[-tmpIdx,"g"])
+      err0tmp <- 1-sum(diag(tblTmp))/sum(tblTmp)
+      # randomize that one attribute:
+      dfTmpRnd <- dfTmp
+      dfTmpRnd[,iCol] <- sample(dfTmpRnd[,iCol])
+      ##tmpIdx <- sample(nrow(dfTmp),nrow(dfTmp),replace = TRUE)
+      # fit model and calculate error on such 
+      # data with one attribute randomized:
+      tblTmp <- table(predict(svm(g~.,dfTmpRnd[tmpIdx,]),newdata = dfTmpRnd[-tmpIdx,]),dfTmpRnd[-tmpIdx,"g"])
+      err1tmp <- 1-sum(diag(tblTmp))/sum(tblTmp)
+      dErrTmp[iSim] <- err1tmp - err0tmp
+    }
+    dfResTmp <- rbind(dfResTmp,data.frame(nNull=paste0("N(null)=",nNull),attr=paste0("V",iCol),viSVM=mean(dErrTmp)/sd(dErrTmp)))
+    #cat(nNull,colnames(dfTmp)[iCol],mean(dErrTmp),mean(dErrTmp)/sd(dErrTmp),fill=TRUE)
+  }
+}
+ggplot(dfResTmp,aes(x=attr,y=viSVM))+geom_point()+facet_wrap(~nNull,scales="free_x",ncol=5)
+```
+
+As one would expect, this approach seems to correctly indicate the first two attributes in this simulation setup as those scrambling of which results in the most pronounced increase in model error.
+
+Now let's apply the same approach to the census income data, by taking multiple random samples of the data of fairly modest size (so that the optimization converges in practically useful time frame) and estimating model performance before and randomization of each of the model attributes.
+
+```{r viSVMcensinc}
+dfTmpSVMvi <- NULL
+tmpDat <- censIncAll[,!colnames(censIncAll)%in%c("oriTrainTest","EduCnt","FnlWgt","NativeCountry")]
+for ( iCol in 1:ncol(tmpDat) ) {
+  if ( colnames(tmpDat)[iCol] == "IncomeCtg" ) {
+    next
+  }
+  dErrTmp <- numeric()
+  for ( iTry in 1:10 ) {
+    tmpIdx <- sample(nrow(tmpDat),5000)
+    tmpDatTry <- tmpDat[tmpIdx,]
+    errOriRndTmp <- numeric()
+    for ( iOriRnd in 1:2 ) {
+      if ( iOriRnd == 2 ) {
+        tmpDatTry[,iCol] <- sample(tmpDatTry[,iCol])
+      }
+      svmTmp <- svm(IncomeCtg~.,data=tmpDatTry[1:(nrow(tmpDatTry)/2),],cost=10,kernel="radial",gamma=0.01)
+      tblTmp <- table(tmpDatTry[-(1:(nrow(tmpDatTry)/2)),"IncomeCtg"],predict(svmTmp,newdata=tmpDatTry[-(1:(nrow(tmpDatTry)/2)),]))
+      errOriRndTmp[iOriRnd] <- 1-sum(diag(tblTmp))/sum(tblTmp)
+    }
+    dErrTmp[iTry] <- (errOriRndTmp %*% c(-1,1))[1,1]
+    ###cat(iCol,colnames(tmpDat)[iCol],errOriRndTmp,dErrTmp[iTry],fill=TRUE)
+  }
+  dfTmpSVMvi <- rbind(dfTmpSVMvi,data.frame(attr=colnames(tmpDat)[iCol],varImpSVM=mean(dErrTmp)/sd(dErrTmp)))
+}
+dfTmpSVMvi <- dfTmpSVMvi[order(dfTmpSVMvi$varImpSVM,decreasing = TRUE),]
+plot(dfTmpSVMvi[,"varImpSVM"],xlab="",xaxt="n",ylab="",main="Variable importance in SVM")
+abline(h=0,lty=2)
+axis(1,1:nrow(dfTmpSVMvi),dfTmpSVMvi[,"attr"],las=2)
+```
+
+Similarly to what we've seen for random forest capital gain appears to be the most important predictor of higher income, race and sex are among those least influential.
